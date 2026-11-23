@@ -237,27 +237,69 @@ static int runPse(const wstring& remote, bool wait = true) {
 }
 
 // ---------- подключение ----------
+static wstring sysMessage(DWORD code) {
+    wchar_t* buf = nullptr;
+    DWORD n = FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                             nullptr, code, 0, (LPWSTR)&buf, 0, nullptr);
+    wstring r = n && buf ? trim(wstring(buf, n)) : wstring();
+    if (buf) LocalFree(buf);
+    return r;
+}
+
+static wstring accessHint(DWORD e) {
+    switch (e) {
+        case ERROR_ACCESS_DENIED:
+            return L"Отказано в доступе: у учётной записи нет прав администратора на этом ПК. "
+                   L"Укажите DOMAIN\\admin и пароль в окне программы. Для локальных (не доменных) учёток "
+                   L"может мешать UAC-фильтр: параметр LocalAccountTokenFilterPolicy=1.";
+        case ERROR_LOGON_FAILURE:
+        case ERROR_BAD_USERNAME:
+            return L"Неверное имя пользователя или пароль.";
+        default: break;
+    }
+    if (e == 53)  // ERROR_BAD_NETPATH
+        return L"Сетевой путь не найден: ПК выключен, имя не резолвится (попробуйте FQDN или IP) "
+               L"или брандмауэр блокирует SMB (TCP 445).";
+    if (e == 67)  // ERROR_BAD_NET_NAME
+        return L"Сетевое имя не найдено: админ-шара C$ отключена или не работает служба \"Сервер\" (LanmanServer) на ПК.";
+    if (e == 1219)
+        return L"Конфликт сессий: к этому ПК уже есть подключение под другой учёткой. "
+               L"Выполните в cmd: net use \\\\" + g_pc + L" /delete  и повторите.";
+    if (e == 1203 || e == 1222)
+        return L"Сеть недоступна или нет маршрута до ПК.";
+    return L"";
+}
+
 static bool connectPc() {
+    wstring root = L"\\\\" + g_pc + L"\\C$\\";
     if (!g_user.empty()) {
         NETRESOURCEW nr{};
-        nr.dwType = RESOURCETYPE_ANY;
-        wstring rn = L"\\\\" + g_pc + L"\\IPC$";
+        nr.dwType = RESOURCETYPE_DISK;
+        wstring rn = L"\\\\" + g_pc + L"\\C$";
         nr.lpRemoteName = (LPWSTR)rn.c_str();
         DWORD r = WNetAddConnection2W(&nr, g_pass.c_str(), g_user.c_str(), 0);
-        if (r != NO_ERROR && r != ERROR_SESSION_CREDENTIAL_CONFLICT && r != ERROR_ALREADY_ASSIGNED) {
-            out(L"[ОШИБКА] Не удалось подключиться к \\\\" + g_pc + L" с указанной учётной записью, код " + std::to_wstring(r));
+        if (r != NO_ERROR && r != ERROR_SESSION_CREDENTIAL_CONFLICT && r != ERROR_ALREADY_ASSIGNED && r != ERROR_DEVICE_ALREADY_REMEMBERED) {
+            out(L"[ОШИБКА] Не удалось подключиться к \\\\" + g_pc + L"\\C$ под " + g_user + L", код " + std::to_wstring(r) +
+                L": " + sysMessage(r));
+            wstring h = accessHint(r);
+            if (!h.empty()) out(L"  Подсказка: " + h);
             return false;
         }
     }
-    if (!exists(L"\\\\" + g_pc + L"\\C$\\")) {
-        out(L"[ОШИБКА] Нет доступа к \\\\" + g_pc + L"\\C$ (ПК выключен, нет прав администратора или закрыт SMB).");
+    if (GetFileAttributesW(root.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        DWORD e = GetLastError();
+        out(L"[ОШИБКА] Нет доступа к " + root + L", код " + std::to_wstring(e) + L": " + sysMessage(e));
+        wstring h = accessHint(e);
+        if (!h.empty()) out(L"  Подсказка: " + h);
+        if (g_user.empty() && (e == ERROR_ACCESS_DENIED || e == ERROR_LOGON_FAILURE))
+            out(L"  Запустите программу от администратора домена или введите учётную запись в поле \"Учётная запись\".");
         return false;
     }
     return true;
 }
 
 static void disconnectPc() {
-    if (!g_user.empty() && !g_pc.empty()) WNetCancelConnection2W((L"\\\\" + g_pc + L"\\IPC$").c_str(), 0, TRUE);
+    if (!g_user.empty() && !g_pc.empty()) WNetCancelConnection2W((L"\\\\" + g_pc + L"\\C$").c_str(), 0, TRUE);
 }
 
 // ---------- служба удалённого реестра ----------
