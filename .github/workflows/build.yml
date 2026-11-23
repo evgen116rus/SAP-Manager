@@ -1,1 +1,44 @@
+name: build
 
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build sap_manager.exe
+        shell: cmd
+        run: |
+          dir
+          mkdir dist
+          mkdir obj
+          cl /nologo /O2 /EHsc /MT /std:c++17 /utf-8 /DUNICODE /D_UNICODE sap_manager.cpp /Fo:obj\ /Fe:dist\sap_manager.exe /link /SUBSYSTEM:WINDOWS
+          if errorlevel 1 exit /b 1
+          if exist saplogon_options.reg copy /Y saplogon_options.reg dist\
+          if exist saplogon_options_HKCU.reg copy /Y saplogon_options_HKCU.reg dist\
+          if exist set_xml_path.reg copy /Y set_xml_path.reg dist\
+          exit /b 0
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sap_manager
+          path: dist/*
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
