@@ -10,7 +10,7 @@
   3. Business Explorer (BE / SapBI)
   4. SAP Secure Login Client
   5. SAP Crypto (`sapcrypto.dll`, `sapgenpse.exe`, `slcryptokernel.dll`, `ssfrfc.ini`)
-  6. `set_xml_path.reg` (пути XML)
+  6. `set_xml_path.reg` (пути XML), применяется к реестру вошедшего пользователя
   7. Настройки SAP Logon (reg) для вошедшего пользователя
 - Проверка, установлен ли SAP GUI (наличие и версия `saplogon.exe`, наличие деинсталлятора).
 - Проверка компонентов SAP Crypto: на месте / отсутствует / отличается по размеру от эталона. При необходимости копирование.
@@ -25,7 +25,7 @@
 - `pse.exe` (PsExec) рядом с программой или в `PATH`.
 - Доступ к админ-шаре `\\ПК\C$` и открытый SMB/RPC на удалённом ПК.
 - Доступ к сетевым дистрибутивам (см. «Настройки»).
-- Файлы `saplogon_options.reg` (и при желании `saplogon_options_HKCU.reg`) рядом с `sap_manager.exe`.
+- Файлы `saplogon_options.reg` (и при желании `saplogon_options_HKCU.reg`) рядом с `sap_manager.exe`. `set_xml_path.reg` берётся из дистрибутива (`SapInstall760\#`), а если он недоступен, то из файла рядом с exe.
 
 ## Использование
 
@@ -41,12 +41,14 @@
 |---|---|
 | Удалить SAP | Удаляет SapBI, SAP GUI, PDF Print и SLC через `NwSapSetup.exe`, затем папку `SAP` |
 | Crypto: проверить | Проверяет файлы Crypto и предлагает скопировать недостающие |
-| Reg пользователю | Применяет reg-файл для вошедшего пользователя |
+| Reg пользователю | Применяет `set_xml_path.reg` и `saplogon_options.reg` для вошедшего пользователя |
 | Статус | Полная проверка состояния ПК |
 
 Поле **«Пользователь для reg»** (`DOMAIN\user`) необязательно: если оно пустое, вошедший пользователь определяется автоматически. Если сессий несколько, программа спросит, для какой применять настройки.
 
 ## Как применяются reg-файлы
+
+Это относится к обоим файлам: `set_xml_path.reg` и `saplogon_options.reg`.
 
 1. Включается служба `RemoteRegistry` (`sc config ... start= auto`, `sc start ...`) через `pse.exe`.
 2. Определяется вошедший пользователь и его SID.
@@ -77,6 +79,7 @@
 sap_manager.cpp
 saplogon_options.reg
 saplogon_options_HKCU.reg
+set_xml_path.reg   (необязательно, запасной вариант)
 .github/workflows/build.yml
 ```
 

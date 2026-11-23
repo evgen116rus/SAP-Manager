@@ -44,6 +44,7 @@ static const wstring CRYPTO = DIST_ROOT + L"\\OLD\\SapInstall740\\#\\SapCrypto";
 static const wchar_t* PSE_SERVICE = L"ps_sap";                 // pse.exe -r ps_sap
 static const wchar_t* REG_MAIN = L"saplogon_options.reg";      // лежит рядом с exe
 static const wchar_t* REG_HKCU = L"saplogon_options_HKCU.reg"; // запасной вариант
+static const wchar_t* REG_XML = L"set_xml_path.reg";           // запасной вариант (рядом с exe)
 static const wchar_t* REMOTE_TMP_REG = L"C:\\Windows\\Temp\\ps_sap_user.reg";
 // =========================================================
 
@@ -65,7 +66,7 @@ static const wchar_t* COMP_NAMES[NCOMP] = {
     L"Business Explorer (BE / SapBI)",
     L"SAP Secure Login Client",
     L"SAP Crypto (библиотеки)",
-    L"set_xml_path.reg (пути XML)",
+    L"set_xml_path.reg (пути XML) для вошедшего пользователя",
     L"Настройки SAP Logon (reg) для вошедшего пользователя"};
 
 static HWND g_hwnd = nullptr, g_hLog = nullptr;
@@ -412,9 +413,57 @@ static wstring rewriteReg(const wstring& t, const wstring& sid) {
     return res;
 }
 
-// Добавляет reg-файл в реестр ВОШЕДШЕГО пользователя удалённого ПК
-static void applyRegToUser() {
-    out(L"=== Применение reg-файла для вошедшего пользователя ===");
+// Первый ключ HKEY_CURRENT_USER из reg-файла (для проверки результата)
+static wstring firstHkcuKey(const wstring& t) {
+    const wstring pre = L"[HKEY_CURRENT_USER\\";
+    std::wistringstream ss(t);
+    wstring line;
+    while (std::getline(ss, line)) {
+        if (line.compare(0, pre.size(), pre) == 0) {
+            size_t e = line.find(L']');
+            return line.substr(pre.size(), e == wstring::npos ? wstring::npos : e - pre.size());
+        }
+    }
+    return L"";
+}
+
+// Импортирует один reg-файл в реестр пользователя с заданным SID
+static bool importRegForUser(const wstring& src, const wstring& sid, bool rr) {
+    out(L"Reg-файл: " + src);
+    wstring text;
+    if (!readTextFile(src, text)) { out(L"[ОШИБКА] Не удалось прочитать " + src); return false; }
+
+    wchar_t tmp[MAX_PATH];
+    GetTempPathW(MAX_PATH, tmp);
+    wstring local = wstring(tmp) + L"ps_sap_user.reg";
+    if (!writeUtf16File(local, rewriteReg(text, sid))) { out(L"[ОШИБКА] Не удалось создать временный reg-файл."); return false; }
+
+    wstring remoteShare = adminPath(REMOTE_TMP_REG);
+    if (!CopyFileW(local.c_str(), remoteShare.c_str(), FALSE)) {
+        out(L"[ОШИБКА] Не удалось скопировать reg на ПК, код " + std::to_wstring(GetLastError()));
+        DeleteFileW(local.c_str());
+        return false;
+    }
+    DeleteFileW(local.c_str());
+
+    int rc = runPse(wstring(L"reg import ") + REMOTE_TMP_REG);
+    DeleteFileW(remoteShare.c_str());
+    if (rc != 0) { out(L"[ОШИБКА] reg import завершился с кодом " + std::to_wstring(rc)); return false; }
+
+    wstring key = firstHkcuKey(text);
+    if (rr && !key.empty()) {
+        bool ok = regKeyExists(sid + L"\\" + key);
+        out(ok ? L"[OK] Применено, ключ найден: HKEY_USERS\\<SID>\\" + key
+               : L"[ВНИМАНИЕ] Импорт выполнен, но ключ не найден: " + key);
+    } else {
+        out(L"[OK] Импорт выполнен.");
+    }
+    return true;
+}
+
+// Применяет reg-файлы к реестру ВОШЕДШЕГО пользователя удалённого ПК
+static void applyRegFiles(const std::vector<wstring>& files) {
+    out(L"=== Применение reg-файлов для вошедшего пользователя ===");
     bool rr = ensureRemoteRegistry();
 
     wstring acc, sid;
@@ -425,40 +474,22 @@ static void applyRegToUser() {
         out(L"[ОШИБКА] Профиль пользователя не загружен в HKEY_USERS на " + g_pc + L" (пользователь не вошёл?).");
         return;
     }
+    for (auto& f : files) importRegForUser(f, sid, rr);
+}
 
-    wstring src = g_exeDir + REG_MAIN;
-    if (!exists(src)) src = g_exeDir + REG_HKCU;
-    wstring text;
-    if (!readTextFile(src, text)) {
-        out(L"[ОШИБКА] Не найден reg-файл рядом с программой: " + wstring(REG_MAIN) + L" / " + REG_HKCU);
-        return;
+static wstring optionsRegPath() {
+    wstring p = g_exeDir + REG_MAIN;
+    if (!exists(p)) p = g_exeDir + REG_HKCU;
+    return p;
+}
+
+static wstring xmlRegPath() {
+    wstring p = SAP760 + L"\\#\\set_xml_path.reg";
+    if (!exists(p)) {
+        wstring q = g_exeDir + REG_XML;
+        if (exists(q)) return q;
     }
-    out(L"Reg-файл: " + src);
-
-    wchar_t tmp[MAX_PATH];
-    GetTempPathW(MAX_PATH, tmp);
-    wstring local = wstring(tmp) + L"ps_sap_user.reg";
-    if (!writeUtf16File(local, rewriteReg(text, sid))) { out(L"[ОШИБКА] Не удалось создать временный reg-файл."); return; }
-
-    wstring remoteShare = adminPath(REMOTE_TMP_REG);
-    if (!CopyFileW(local.c_str(), remoteShare.c_str(), FALSE)) {
-        out(L"[ОШИБКА] Не удалось скопировать reg на ПК, код " + std::to_wstring(GetLastError()));
-        DeleteFileW(local.c_str());
-        return;
-    }
-    DeleteFileW(local.c_str());
-
-    int rc = runPse(wstring(L"reg import ") + REMOTE_TMP_REG);
-    DeleteFileW(remoteShare.c_str());
-    if (rc != 0) { out(L"[ОШИБКА] reg import завершился с кодом " + std::to_wstring(rc)); return; }
-
-    if (rr) {
-        bool ok = regKeyExists(sid + L"\\Software\\SAP\\SAPLogon\\Settings");
-        out(ok ? L"[OK] Настройки SAP Logon применены (ключ найден в HKEY_USERS\\<SID>)."
-               : L"[ВНИМАНИЕ] Импорт выполнен, но ключ SAPLogon\\Settings не найден.");
-    } else {
-        out(L"[OK] Импорт выполнен (проверка через удалённый реестр недоступна).");
-    }
+    return p;
 }
 
 // ---------- SAP Crypto ----------
@@ -567,15 +598,14 @@ static void doInstall() {
         if (rc != 0) out(L"  [ВНИМАНИЕ] код возврата " + std::to_wstring(rc) + L" (3010 = нужна перезагрузка)");
     }
     if (g_sel[4]) copyCrypto();
-    if (g_sel[5]) {
-        out(L"Применение set_xml_path.reg...");
-        runPse(L"regedit /S " + SAP760 + L"\\#\\set_xml_path.reg");
-    }
     if (g_sel[0] && exists(SAP770 + L"\\CheckFileServices.exe")) {
         out(L"Запуск CheckFileServices.exe (без ожидания)...");
         runPse(SAP770 + L"\\CheckFileServices.exe", false);
     }
-    if (g_sel[6]) applyRegToUser();
+    std::vector<wstring> regs;
+    if (g_sel[5]) regs.push_back(xmlRegPath());
+    if (g_sel[6]) regs.push_back(optionsRegPath());
+    if (!regs.empty()) applyRegFiles(regs);
     showStatus();
 }
 
@@ -614,7 +644,7 @@ static DWORD WINAPI worker(LPVOID) {
             case T_INSTALL: doInstall(); break;
             case T_UNINSTALL: doUninstall(); break;
             case T_CRYPTO: doCrypto(); break;
-            case T_REG: applyRegToUser(); break;
+            case T_REG: { std::vector<wstring> regs; regs.push_back(xmlRegPath()); regs.push_back(optionsRegPath()); applyRegFiles(regs); break; }
         }
     }
     out(L"--- готово ---\n");
