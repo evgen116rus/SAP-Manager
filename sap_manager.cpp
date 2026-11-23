@@ -11,6 +11,8 @@
 #endif
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <windowsx.h>
 #include <commctrl.h>
@@ -23,6 +25,7 @@
 #include <string>
 #include <vector>
 
+#pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "wtsapi32.lib")
 #pragma comment(lib, "version.lib")
@@ -50,7 +53,7 @@ static const wchar_t* REMOTE_TMP_REG = L"C:\\Windows\\Temp\\ps_sap_user.reg";
 
 // ---------- ID элементов и сообщения ----------
 enum {
-    IDC_PC = 100, IDC_USER, IDC_PASS, IDC_REGUSER,
+    IDC_PC = 100, IDC_USER, IDC_PASS, IDC_REGUSER, IDC_RUNAS,
     IDC_CHK0 = 120,  // 7 флажков: 120..126
     IDC_BTN_INSTALL = 140, IDC_BTN_UNINSTALL, IDC_BTN_CRYPTO, IDC_BTN_REG, IDC_BTN_STATUS,
     IDC_LOG = 160
@@ -74,6 +77,7 @@ static HFONT g_font = nullptr, g_monoFont = nullptr;
 static wstring g_pc, g_user, g_pass, g_regUser, g_pse, g_exeDir;
 static bool g_sel[NCOMP] = {};
 static volatile bool g_busy = false;
+static bool g_runAsUser = false;  // true: процесс на ПК от указанной учётки (-u), false: от SYSTEM (-s)
 static Task g_task = T_STATUS;
 
 // ---------- вывод в лог (потокобезопасно) ----------
@@ -151,6 +155,14 @@ static wstring conv(UINT cp, const char* d, int n) {
     return r;
 }
 
+// Вывод pse.exe через канал: свои сообщения psexec пишет в ANSI, вывод удалённых программ в OEM.
+// Выбираем вариант, в котором больше кириллических букв.
+static wstring smartDecode(const char* d, int n) {
+    wstring a = conv(CP_ACP, d, n), o = conv(CP_OEMCP, d, n);
+    auto cyr = [](const wstring& t) { int c = 0; for (wchar_t ch : t) if (ch >= 0x0400 && ch <= 0x04FF) c++; return c; };
+    return cyr(o) > cyr(a) ? o : a;
+}
+
 static bool readTextFile(const wstring& p, wstring& t) {
     HANDLE h = CreateFileW(p.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
     if (h == INVALID_HANDLE_VALUE) return false;
@@ -189,7 +201,10 @@ static bool findPse() {
 static int runPse(const wstring& remote, bool wait = true) {
     wstring cmd = L"\"" + g_pse + L"\" \\\\" + g_pc + L" -accepteula -r " + PSE_SERVICE + L" -h";
     if (g_user.empty()) cmd += L" -s";
-    else cmd += L" -u \"" + g_user + L"\" -p \"" + g_pass + L"\"";
+    else {
+        cmd += L" -u \"" + g_user + L"\" -p \"" + g_pass + L"\"";
+        if (!g_runAsUser) cmd += L" -s";  // учётка только для подключения, процесс от SYSTEM
+    }
     if (!wait) cmd += L" -d";
     cmd += L" " + remote;
     out(L"  > " + remote);
@@ -224,8 +239,11 @@ static int runPse(const wstring& remote, bool wait = true) {
     char chunk[4096];
     DWORD n = 0;
     while (ReadFile(rd, chunk, sizeof chunk, &n, nullptr) && n > 0) {
-        wstring t = trim(conv(CP_OEMCP, chunk, (int)n));
+        wstring t = trim(smartDecode(chunk, (int)n));
         if (!t.empty()) out(L"    " + t);
+        if (t.find(L"режим входа") != wstring::npos || t.find(L"logon type") != wstring::npos)
+            out(L"  Подсказка: политика ПК запрещает этой учётке такой вход. Снимите флажок \"от имени указанной учётки\" "
+                L"(процесс запустится от SYSTEM).");
     }
     CloseHandle(rd);
     WaitForSingleObject(pi.hProcess, INFINITE);
@@ -270,32 +288,117 @@ static wstring accessHint(DWORD e) {
     return L"";
 }
 
-static bool connectPc() {
-    wstring root = L"\\\\" + g_pc + L"\\C$\\";
+// ---- диагностика сети ----
+static std::vector<wstring> resolveHost(const wstring& name) {
+    std::vector<wstring> r;
+    ADDRINFOW hints{};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    ADDRINFOW* res = nullptr;
+    if (GetAddrInfoW(name.c_str(), L"445", &hints, &res) == 0) {
+        for (ADDRINFOW* p = res; p; p = p->ai_next) {
+            wchar_t b[64] = {};
+            InetNtopW(AF_INET, &((sockaddr_in*)p->ai_addr)->sin_addr, b, 64);
+            wstring ip = b;
+            bool dup = false;
+            for (auto& x : r) dup = dup || x == ip;
+            if (!dup) r.push_back(ip);
+        }
+        FreeAddrInfoW(res);
+    }
+    return r;
+}
+
+static wstring reverseName(const wstring& ip) {
+    sockaddr_in sa{};
+    sa.sin_family = AF_INET;
+    if (InetPtonW(AF_INET, ip.c_str(), &sa.sin_addr) != 1) return L"";
+    wchar_t host[NI_MAXHOST] = {};
+    if (GetNameInfoW((sockaddr*)&sa, sizeof sa, host, NI_MAXHOST, nullptr, 0, NI_NAMEREQD) != 0) return L"";
+    return host;
+}
+
+static bool tcpPortOpen(const wstring& ip, int port, int timeoutMs) {
+    sockaddr_in sa{};
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((u_short)port);
+    if (InetPtonW(AF_INET, ip.c_str(), &sa.sin_addr) != 1) return false;
+    SOCKET so = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (so == INVALID_SOCKET) return false;
+    u_long nb = 1;
+    ioctlsocket(so, FIONBIO, &nb);
+    connect(so, (sockaddr*)&sa, sizeof sa);
+    fd_set wf, ef;
+    FD_ZERO(&wf);
+    FD_ZERO(&ef);
+    FD_SET(so, &wf);
+    FD_SET(so, &ef);
+    timeval tv{timeoutMs / 1000, (timeoutMs % 1000) * 1000};
+    int r = select(0, nullptr, &wf, &ef, &tv);
+    bool ok = r > 0 && FD_ISSET(so, &wf) && !FD_ISSET(so, &ef);
+    closesocket(so);
+    return ok;
+}
+
+// Пробует подключиться к \\host\C$; при заданной учётке сначала создаёт сеансовое подключение
+static bool tryShare(const wstring& host, DWORD& err) {
     if (!g_user.empty()) {
         NETRESOURCEW nr{};
         nr.dwType = RESOURCETYPE_DISK;
-        wstring rn = L"\\\\" + g_pc + L"\\C$";
+        wstring rn = L"\\\\" + host + L"\\C$";
         nr.lpRemoteName = (LPWSTR)rn.c_str();
         DWORD r = WNetAddConnection2W(&nr, g_pass.c_str(), g_user.c_str(), 0);
-        if (r != NO_ERROR && r != ERROR_SESSION_CREDENTIAL_CONFLICT && r != ERROR_ALREADY_ASSIGNED && r != ERROR_DEVICE_ALREADY_REMEMBERED) {
-            out(L"[ОШИБКА] Не удалось подключиться к \\\\" + g_pc + L"\\C$ под " + g_user + L", код " + std::to_wstring(r) +
-                L": " + sysMessage(r));
-            wstring h = accessHint(r);
-            if (!h.empty()) out(L"  Подсказка: " + h);
+        if (r != NO_ERROR && r != ERROR_SESSION_CREDENTIAL_CONFLICT && r != ERROR_ALREADY_ASSIGNED &&
+            r != ERROR_DEVICE_ALREADY_REMEMBERED) {
+            err = r;
             return false;
         }
     }
-    if (GetFileAttributesW(root.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        DWORD e = GetLastError();
-        out(L"[ОШИБКА] Нет доступа к " + root + L", код " + std::to_wstring(e) + L": " + sysMessage(e));
-        wstring h = accessHint(e);
-        if (!h.empty()) out(L"  Подсказка: " + h);
-        if (g_user.empty() && (e == ERROR_ACCESS_DENIED || e == ERROR_LOGON_FAILURE))
-            out(L"  Запустите программу от администратора домена или введите учётную запись в поле \"Учётная запись\".");
+    if (GetFileAttributesW((L"\\\\" + host + L"\\C$\\").c_str()) == INVALID_FILE_ATTRIBUTES) {
+        err = GetLastError();
         return false;
     }
     return true;
+}
+
+static bool connectPc() {
+    out(L"Подключение к \\\\" + g_pc + L"\\C$ (имя: \"" + g_pc + L"\", длина " + std::to_wstring(g_pc.size()) + L")...");
+    DWORD e = 0;
+    if (tryShare(g_pc, e)) return true;
+
+    out(L"[ОШИБКА] Нет доступа к \\\\" + g_pc + L"\\C$, код " + std::to_wstring(e) + L": " + sysMessage(e));
+    wstring h = accessHint(e);
+    if (!h.empty()) out(L"  Подсказка: " + h);
+
+    // Диагностика: что за адрес и отвечает ли SMB
+    out(L"Диагностика:");
+    std::vector<wstring> ips = resolveHost(g_pc);
+    if (ips.empty()) {
+        out(L"  Имя \"" + g_pc + L"\" не разрешается в IP-адрес с этого ПК.");
+        return false;
+    }
+    wstring okIp;
+    for (auto& ip : ips) {
+        bool open = tcpPortOpen(ip, 445, 3000);
+        wstring rev = reverseName(ip);
+        out(L"  " + ip + L"  обратное имя: " + (rev.empty() ? wstring(L"(нет)") : rev) + L"  порт 445: " +
+            (open ? L"открыт" : L"НЕ отвечает"));
+        if (open && okIp.empty()) okIp = ip;
+    }
+    if (okIp.empty()) {
+        out(L"  Порт 445 (SMB) недоступен: ПК выключен, другой сегмент сети или блокирует брандмауэр.");
+        return false;
+    }
+    out(L"  Если обратное имя не совпадает с введённым, в DNS устаревшая запись (имя указывает на другой ПК).");
+
+    DWORD e2 = 0;
+    if (okIp != g_pc && tryShare(okIp, e2)) {
+        out(L"[OK] Доступ по IP-адресу " + okIp + L" работает, дальше использую его.");
+        g_pc = okIp;
+        return true;
+    }
+    if (okIp != g_pc) out(L"  Доступ по IP " + okIp + L" тоже не удался, код " + std::to_wstring(e2) + L": " + sysMessage(e2));
+    return false;
 }
 
 static void disconnectPc() {
@@ -702,6 +805,12 @@ static void startTask(Task t) {
     if (g_busy) return;
     wstring pc = trim(getText(GetDlgItem(g_hwnd, IDC_PC)));
     while (!pc.empty() && pc[0] == L'\\') pc.erase(0, 1);
+    {
+        wstring clean;
+        for (wchar_t c : pc) if (c > 127 || iswalnum(c) || c == L'.' || c == L'-' || c == L'_') clean += c;
+        if (clean != pc) out(L"[ВНИМАНИЕ] Из имени удалены лишние символы: \"" + pc + L"\" -> \"" + clean + L"\"");
+        pc = clean;
+    }
     if (pc.empty()) {
         MessageBoxW(g_hwnd, L"Введите имя компьютера.", L"SAP Manager", MB_OK | MB_ICONWARNING);
         SetFocus(GetDlgItem(g_hwnd, IDC_PC));
@@ -716,6 +825,7 @@ static void startTask(Task t) {
     g_user = trim(getText(GetDlgItem(g_hwnd, IDC_USER)));
     g_pass = getText(GetDlgItem(g_hwnd, IDC_PASS));
     g_regUser = trim(getText(GetDlgItem(g_hwnd, IDC_REGUSER)));
+    g_runAsUser = Button_GetCheck(GetDlgItem(g_hwnd, IDC_RUNAS)) == BST_CHECKED;
     for (int i = 0; i < NCOMP; i++) g_sel[i] = Button_GetCheck(GetDlgItem(g_hwnd, IDC_CHK0 + i)) == BST_CHECKED;
     g_task = t;
     g_busy = true;
@@ -744,9 +854,9 @@ static void createControls() {
     mk(L"STATIC", L"Пароль:", 0, 585, 14, 55, 20, -1);
     mk(L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL | ES_PASSWORD, 645, 10, 110, 24, IDC_PASS, WS_EX_CLIENTEDGE);
 
-    mk(L"STATIC", L"Пользователь для reg:", 0, 10, 46, 135, 20, -1);
-    mk(L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL, 150, 42, 200, 24, IDC_REGUSER, WS_EX_CLIENTEDGE);
-    mk(L"STATIC", L"DOMAIN\\user; пусто = вошедший пользователь определяется сам", 0, 360, 46, 395, 20, -1);
+    mk(L"STATIC", L"Пользователь для reg (пусто = авто):", 0, 10, 46, 225, 20, -1);
+    mk(L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL, 240, 42, 150, 24, IDC_REGUSER, WS_EX_CLIENTEDGE);
+    mk(L"BUTTON", L"Процесс на ПК от указанной учётки (иначе SYSTEM)", WS_TABSTOP | BS_AUTOCHECKBOX, 400, 44, 355, 20, IDC_RUNAS);
 
     mk(L"BUTTON", L"Компоненты установки", BS_GROUPBOX, 10, 76, 745, 118, -1);
     for (int i = 0; i < NCOMP; i++) {
@@ -830,6 +940,8 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 }
 
 int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR, int show) {
+    WSADATA wsa;
+    WSAStartup(MAKEWORD(2, 2), &wsa);
     INITCOMMONCONTROLSEX ic{sizeof ic, ICC_STANDARD_CLASSES};
     InitCommonControlsEx(&ic);
 
