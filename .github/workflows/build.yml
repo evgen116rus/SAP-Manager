@@ -15,7 +15,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: ilammy/msvc-dev-cmd@v1
+      - uses: ilammy/msvc-dev
+-cmd@v1
         with:
           arch: x64
 
@@ -29,6 +30,7 @@ jobs:
           if errorlevel 1 exit /b 1
           if exist saplogon_options.reg copy /Y saplogon_options.reg dist\
           if exist saplogon_options_HKCU.reg copy /Y saplogon_options_HKCU.reg dist\
+          if exist set_xml_path.reg copy /Y set_xml_path.reg dist\
           exit /b 0
 
       - uses: actions/upload-artifact@v4
