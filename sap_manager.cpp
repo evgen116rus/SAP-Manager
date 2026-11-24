@@ -20,6 +20,8 @@
 #include <wtsapi32.h>
 #include <sddl.h>
 #include <shlobj.h>
+#include <commdlg.h>
+#include <objbase.h>
 #include <cstdlib>
 #include <sstream>
 #include <string>
@@ -31,6 +33,8 @@
 #pragma comment(lib, "version.lib")
 #pragma comment(lib, "mpr.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "comdlg32.lib")
+#pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "comctl32.lib")
@@ -56,6 +60,8 @@ enum {
     IDC_PC = 100, IDC_USER, IDC_PASS, IDC_REGUSER, IDC_RUNAS,
     IDC_CHK0 = 120,  // 7 флажков: 120..126
     IDC_BTN_INSTALL = 140, IDC_BTN_UNINSTALL, IDC_BTN_CRYPTO, IDC_BTN_REG, IDC_BTN_STATUS,
+    IDC_PATH0 = 200,    // поля путей: 200..206
+    IDC_BROWSE0 = 220,  // кнопки "...": 220..226
     IDC_LOG = 160
 };
 static const int NCOMP = 7;
@@ -66,17 +72,27 @@ enum Task { T_STATUS, T_INSTALL, T_UNINSTALL, T_CRYPTO, T_REG };
 static const wchar_t* COMP_NAMES[NCOMP] = {
     L"SAP GUI 7.70",
     L"PDF Print GUI",
-    L"Business Explorer (BE / SapBI)",
+    L"Business Explorer (BE)",
     L"SAP Secure Login Client",
-    L"SAP Crypto (библиотеки)",
-    L"set_xml_path.reg (пути XML) для вошедшего пользователя",
-    L"Настройки SAP Logon (reg) для вошедшего пользователя"};
+    L"SAP Crypto",
+    L"set_xml_path.reg (пути XML)",
+    L"saplogon_options.reg (настройки)"};
+// Ключи в sap_manager.ini, секция [Paths]
+static const wchar_t* INI_KEYS[NCOMP] = {
+    L"SapGui", L"PdfPrintGui", L"BusinessExplorer", L"SecureLoginClient", L"SapCrypto", L"SetXmlPathReg", L"SaplogonOptionsReg"};
+// Для компонентов 6 и 7 путь указывает на reg-файл, для остальных на папку
+static bool isFileComp(int i) { return i >= 5; }
+#ifndef EM_SETCUEBANNER
+#define EM_SETCUEBANNER 0x1501
+#endif
 
 static HWND g_hwnd = nullptr, g_hLog = nullptr;
 static HFONT g_font = nullptr, g_monoFont = nullptr;
 static wstring g_pc, g_user, g_pass, g_regUser, g_pse, g_exeDir;
 static bool g_sel[NCOMP] = {};
 static volatile bool g_busy = false;
+static bool g_local = false;      // пустое имя ПК = локальный компьютер
+static wstring g_path[NCOMP];     // пути к файлам установки (из полей/ini)
 static bool g_runAsUser = false;  // true: процесс на ПК от указанной учётки (-u), false: от SYSTEM (-s)
 static Task g_task = T_STATUS;
 
@@ -140,7 +156,10 @@ static wstring fver(const wstring& p) {
 }
 
 // "C:\xxx" -> "\\PC\C$\xxx"
-static wstring adminPath(const wstring& local) { return L"\\\\" + g_pc + L"\\C$\\" + local.substr(3); }
+static wstring adminPath(const wstring& local) {
+    if (g_local) return local;
+    return L"\\\\" + g_pc + L"\\C$\\" + local.substr(3);
+}
 
 static bool isX64() { return exists(adminPath(L"C:\\Program Files (x86)")); }
 static wstring progFiles() { return isX64() ? L"C:\\Program Files (x86)" : L"C:\\Program Files"; }
@@ -199,7 +218,11 @@ static bool findPse() {
 
 // Выполняет команду на удалённом ПК: pse.exe \\PC -r ps_sap ... ; вывод идёт в лог
 static int runPse(const wstring& remote, bool wait = true) {
-    wstring cmd = L"\"" + g_pse + L"\" \\\\" + g_pc + L" -accepteula -r " + PSE_SERVICE + L" -h";
+    wstring cmd;
+    if (g_local) {
+        cmd = remote;  // локально pse не нужен: запускаем команду напрямую
+    } else {
+    cmd = L"\"" + g_pse + L"\" \\\\" + g_pc + L" -accepteula -r " + PSE_SERVICE + L" -h";
     if (g_user.empty()) cmd += L" -s";
     else {
         cmd += L" -u \"" + g_user + L"\" -p \"" + g_pass + L"\"";
@@ -207,7 +230,23 @@ static int runPse(const wstring& remote, bool wait = true) {
     }
     if (!wait) cmd += L" -d";
     cmd += L" " + remote;
+    }
     out(L"  > " + remote);
+
+    if (g_local && !wait) {  // локальный запуск без ожидания
+        std::vector<wchar_t> b2(cmd.begin(), cmd.end());
+        b2.push_back(0);
+        STARTUPINFOW si2{};
+        si2.cb = sizeof si2;
+        PROCESS_INFORMATION pi2{};
+        if (!CreateProcessW(nullptr, b2.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si2, &pi2)) {
+            out(L"[ОШИБКА] Не удалось запустить, код " + std::to_wstring(GetLastError()));
+            return -1;
+        }
+        CloseHandle(pi2.hProcess);
+        CloseHandle(pi2.hThread);
+        return 0;
+    }
 
     SECURITY_ATTRIBUTES sa{};
     sa.nLength = sizeof sa;
@@ -233,7 +272,7 @@ static int runPse(const wstring& remote, bool wait = true) {
     if (nul != INVALID_HANDLE_VALUE) CloseHandle(nul);
     if (!ok) {
         CloseHandle(rd);
-        out(L"[ОШИБКА] Не удалось запустить pse.exe, код " + std::to_wstring(err));
+        out(L"[ОШИБКА] Не удалось запустить " + wstring(g_local ? L"команду" : L"pse.exe") + L", код " + std::to_wstring(err));
         return -1;
     }
     char chunk[4096];
@@ -362,6 +401,11 @@ static bool tryShare(const wstring& host, DWORD& err) {
 }
 
 static bool connectPc() {
+    if (g_local) {
+        out(L"Локальный компьютер: " + g_pc);
+        if (!IsUserAnAdmin()) out(L"[ВНИМАНИЕ] Для установки/удаления на этом ПК запустите программу от имени администратора.");
+        return true;
+    }
     out(L"Подключение к \\\\" + g_pc + L"\\C$ (имя: \"" + g_pc + L"\", длина " + std::to_wstring(g_pc.size()) + L")...");
     DWORD e = 0;
     if (tryShare(g_pc, e)) return true;
@@ -402,7 +446,7 @@ static bool connectPc() {
 }
 
 static void disconnectPc() {
-    if (!g_user.empty() && !g_pc.empty()) WNetCancelConnection2W((L"\\\\" + g_pc + L"\\C$").c_str(), 0, TRUE);
+    if (!g_local && !g_user.empty() && !g_pc.empty()) WNetCancelConnection2W((L"\\\\" + g_pc + L"\\C$").c_str(), 0, TRUE);
 }
 
 // ---------- служба удалённого реестра ----------
@@ -410,7 +454,7 @@ struct SvcInfo { bool ok = false; DWORD start = 0; DWORD state = 0; };
 
 static SvcInfo queryRemoteRegistry() {
     SvcInfo r;
-    SC_HANDLE scm = OpenSCManagerW((L"\\\\" + g_pc).c_str(), nullptr, SC_MANAGER_CONNECT);
+    SC_HANDLE scm = OpenSCManagerW(g_local ? nullptr : (L"\\\\" + g_pc).c_str(), nullptr, SC_MANAGER_CONNECT);
     if (!scm) return r;
     SC_HANDLE s = OpenServiceW(scm, L"RemoteRegistry", SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS);
     if (s) {
@@ -436,6 +480,7 @@ static wstring startName(DWORD t) {
 }
 
 static bool ensureRemoteRegistry() {
+    if (g_local) return true;  // локально служба удалённого реестра не нужна
     SvcInfo s = queryRemoteRegistry();
     if (!s.ok || s.start != SERVICE_AUTO_START) {
         out(L"Служба удалённого реестра: ставлю запуск \"Автоматически\"...");
@@ -458,7 +503,7 @@ static bool ensureRemoteRegistry() {
 
 static bool regKeyExists(const wstring& sub) {
     HKEY root = nullptr;
-    if (RegConnectRegistryW((L"\\\\" + g_pc).c_str(), HKEY_USERS, &root) != ERROR_SUCCESS) return false;
+    if (RegConnectRegistryW(g_local ? nullptr : (L"\\\\" + g_pc).c_str(), HKEY_USERS, &root) != ERROR_SUCCESS) return false;
     HKEY k = nullptr;
     LONG e = RegOpenKeyExW(root, sub.c_str(), 0, KEY_READ, &k);
     if (k) RegCloseKey(k);
@@ -470,11 +515,11 @@ static bool regKeyExists(const wstring& sub) {
 struct Sess { wstring dom, user; DWORD id = 0; };
 
 static bool listUsers(std::vector<Sess>& v) {
-    HANDLE h = WTSOpenServerW((LPWSTR)g_pc.c_str());
-    if (!h) return false;
+    HANDLE h = g_local ? WTS_CURRENT_SERVER_HANDLE : WTSOpenServerW((LPWSTR)g_pc.c_str());
+    if (!g_local && !h) return false;
     PWTS_SESSION_INFOW si = nullptr;
     DWORD n = 0;
-    if (!WTSEnumerateSessionsW(h, 0, 1, &si, &n)) { WTSCloseServer(h); return false; }
+    if (!WTSEnumerateSessionsW(h, 0, 1, &si, &n)) { if (!g_local) WTSCloseServer(h); return false; }
     for (DWORD i = 0; i < n; i++) {
         if (si[i].State != WTSActive && si[i].State != WTSDisconnected) continue;
         LPWSTR u = nullptr, d = nullptr;
@@ -492,18 +537,18 @@ static bool listUsers(std::vector<Sess>& v) {
         if (d) WTSFreeMemory(d);
     }
     WTSFreeMemory(si);
-    WTSCloseServer(h);
+    if (!g_local) WTSCloseServer(h);
     return true;
 }
 
 static bool accountSid(const wstring& acc, wstring& sidStr) {
     DWORD sn = 0, dn = 0;
     SID_NAME_USE use;
-    LookupAccountNameW(g_pc.c_str(), acc.c_str(), nullptr, &sn, nullptr, &dn, &use);
+    LookupAccountNameW(g_local ? nullptr : g_pc.c_str(), acc.c_str(), nullptr, &sn, nullptr, &dn, &use);
     if (!sn) return false;
     std::vector<BYTE> sid(sn);
     std::vector<wchar_t> dom(dn ? dn : 1);
-    if (!LookupAccountNameW(g_pc.c_str(), acc.c_str(), sid.data(), &sn, dom.data(), &dn, &use)) return false;
+    if (!LookupAccountNameW(g_local ? nullptr : g_pc.c_str(), acc.c_str(), sid.data(), &sn, dom.data(), &dn, &use)) return false;
     LPWSTR s = nullptr;
     if (!ConvertSidToStringSidW(sid.data(), &s)) return false;
     sidStr = s;
@@ -609,7 +654,12 @@ static bool importRegForUser(const wstring& src, const wstring& sid, bool rr) {
 // Применяет reg-файлы к реестру ВОШЕДШЕГО пользователя удалённого ПК
 static void applyRegFiles(const std::vector<wstring>& files) {
     out(L"=== Применение reg-файлов для вошедшего пользователя ===");
-    bool rr = ensureRemoteRegistry();
+    bool rr = true;  // локально реестр доступен напрямую
+    if (!g_local) {
+        SvcInfo si = queryRemoteRegistry();
+        rr = si.ok && si.state == SERVICE_RUNNING;
+        if (!rr) out(L"[ВНИМАНИЕ] Служба удалённого реестра не запущена: проверка ключей после импорта пропущена (служба запускается в начале установки и проверки).");
+    }
 
     wstring acc, sid;
     if (!pickUser(acc, sid)) return;
@@ -623,14 +673,18 @@ static void applyRegFiles(const std::vector<wstring>& files) {
 }
 
 static wstring optionsRegPath() {
-    wstring p = g_exeDir + REG_MAIN;
-    if (!exists(p)) p = g_exeDir + REG_HKCU;
+    wstring p = g_path[6];
+    if (p.empty() || !exists(p)) {
+        wstring q = g_exeDir + REG_MAIN;
+        if (!exists(q)) q = g_exeDir + REG_HKCU;
+        if (exists(q)) return q;
+    }
     return p;
 }
 
 static wstring xmlRegPath() {
-    wstring p = SAP760 + L"\\#\\set_xml_path.reg";
-    if (!exists(p)) {
+    wstring p = g_path[5];
+    if (p.empty() || !exists(p)) {
         wstring q = g_exeDir + REG_XML;
         if (exists(q)) return q;
     }
@@ -642,11 +696,12 @@ struct CF { wstring name, src; };
 
 static std::vector<CF> cryptoFiles() {
     wstring arch = isX64() ? L"\\x64" : L"\\x86";
+    const wstring& C = g_path[4];
     std::vector<CF> v;
-    v.push_back({L"sapcrypto.dll", CRYPTO + L"\\sapcrypto.dll"});
-    v.push_back({L"sapgenpse.exe", CRYPTO + L"\\sapgenpse.exe"});
-    v.push_back({L"slcryptokernel.dll", CRYPTO + L"\\slcryptokernel.dll"});
-    v.push_back({L"ssfrfc.ini", CRYPTO + arch + L"\\ssfrfc.ini"});
+    v.push_back({L"sapcrypto.dll", C + L"\\sapcrypto.dll"});
+    v.push_back({L"sapgenpse.exe", C + L"\\sapgenpse.exe"});
+    v.push_back({L"slcryptokernel.dll", C + L"\\slcryptokernel.dll"});
+    v.push_back({L"ssfrfc.ini", C + arch + L"\\ssfrfc.ini"});
     return v;
 }
 
@@ -701,8 +756,9 @@ static void showStatus() {
     int bad = checkCrypto(true);
     out(bad == 0 ? wstring(L"[OK] Все компоненты Crypto на месте.") : L"[ВНИМАНИЕ] Проблемных компонентов: " + std::to_wstring(bad));
 
-    SvcInfo s = queryRemoteRegistry();
-    if (s.ok) out(L"Удалённый реестр: " + startName(s.start) + L", " + (s.state == SERVICE_RUNNING ? L"работает" : L"остановлена"));
+    SvcInfo s = g_local ? SvcInfo() : queryRemoteRegistry();
+    if (g_local) { /* для локального ПК не показываем */ }
+    else if (s.ok) out(L"Удалённый реестр: " + startName(s.start) + L", " + (s.state == SERVICE_RUNNING ? L"работает" : L"остановлена"));
     else out(L"Удалённый реестр: состояние не удалось получить");
 
     std::vector<Sess> v;
@@ -722,20 +778,23 @@ static void doInstall() {
     for (int i = 0; i < NCOMP; i++) if (g_sel[i]) list += L"\n  - " + wstring(COMP_NAMES[i]);
     if (!yn(L"Установить на " + g_pc + L":" + list + L"\n\nПродолжить?")) { out(L"Отменено."); return; }
 
+    if (!g_local) ensureRemoteRegistry();  // только для удалённого ПК, в начале установки
+
     bool installed = sapInstalled();
     if ((g_sel[1] || g_sel[2]) && !g_sel[0] && !installed)
         out(L"[ВНИМАНИЕ] SAP GUI на ПК не установлен, а PDF Print / BE ставятся поверх него.");
     if (g_sel[0] && installed && !yn(L"SAP GUI уже установлен. Переустановить/обновить?", false)) g_sel[0] = false;
 
-    if (!exists(SAP770 + L"\\Setup\\NwSapSetup.exe"))
-        out(L"[ВНИМАНИЕ] Дистрибутив не виден с этого ПК: " + SAP770 + L" (на удалённом ПК он может быть доступен)");
+    for (int i = 0; i < 4; i++)
+        if (g_sel[i] && !exists(g_path[i] + L"\\Setup\\NwSapSetup.exe"))
+            out(L"[ВНИМАНИЕ] Не найден " + g_path[i] + L"\\Setup\\NwSapSetup.exe с этого ПК (на целевом ПК путь может быть доступен)");
 
     struct Step { int idx; const wchar_t* title; wstring cmd; };
     std::vector<Step> steps;
-    steps.push_back({0, L"SAP GUI 7.70", SAP770 + L"\\Setup\\NwSapSetup.exe /Silent /Package=SapGui770 /noDLG"});
-    steps.push_back({1, L"PDF Print GUI", SAP770 + L"\\Setup\\NwSapSetup.exe /Silent /Product=PdfPrintGui /noDLG"});
-    steps.push_back({2, L"Business Explorer", SAP770 + L"\\Setup\\NwSapSetup.exe /Silent /Product=SapBI /noDLG"});
-    steps.push_back({3, L"SAP Secure Login Client", SLC + L"\\Setup\\NwSapSetup.exe /Silent /Product=SLC /noDLG"});
+    steps.push_back({0, L"SAP GUI 7.70", g_path[0] + L"\\Setup\\NwSapSetup.exe /Silent /Package=SapGui770 /noDLG"});
+    steps.push_back({1, L"PDF Print GUI", g_path[1] + L"\\Setup\\NwSapSetup.exe /Silent /Product=PdfPrintGui /noDLG"});
+    steps.push_back({2, L"Business Explorer", g_path[2] + L"\\Setup\\NwSapSetup.exe /Silent /Product=SapBI /noDLG"});
+    steps.push_back({3, L"SAP Secure Login Client", g_path[3] + L"\\Setup\\NwSapSetup.exe /Silent /Product=SLC /noDLG"});
     for (auto& s : steps) {
         if (!g_sel[s.idx]) continue;
         out(L"[установка] " + wstring(s.title));
@@ -743,9 +802,9 @@ static void doInstall() {
         if (rc != 0) out(L"  [ВНИМАНИЕ] код возврата " + std::to_wstring(rc) + L" (3010 = нужна перезагрузка)");
     }
     if (g_sel[4]) copyCrypto();
-    if (g_sel[0] && exists(SAP770 + L"\\CheckFileServices.exe")) {
+    if (g_sel[0] && exists(g_path[0] + L"\\CheckFileServices.exe")) {
         out(L"Запуск CheckFileServices.exe (без ожидания)...");
-        runPse(SAP770 + L"\\CheckFileServices.exe", false);
+        runPse(g_path[0] + L"\\CheckFileServices.exe", false);
     }
     std::vector<wstring> regs;
     if (g_sel[5]) regs.push_back(xmlRegPath());
@@ -785,7 +844,10 @@ static void doCrypto() {
 static DWORD WINAPI worker(LPVOID) {
     if (connectPc()) {
         switch (g_task) {
-            case T_STATUS: showStatus(); break;
+            case T_STATUS:
+                if (!g_local) ensureRemoteRegistry();  // только для удалённого ПК, в начале проверки
+                showStatus();
+                break;
             case T_INSTALL: doInstall(); break;
             case T_UNINSTALL: doUninstall(); break;
             case T_CRYPTO: doCrypto(); break;
@@ -801,6 +863,90 @@ static void setButtons(bool enabled) {
     for (int id = IDC_BTN_INSTALL; id <= IDC_BTN_STATUS; id++) EnableWindow(GetDlgItem(g_hwnd, id), enabled);
 }
 
+// ---------- пути установки: ini + обзор ----------
+static wstring iniFile() { return g_exeDir + L"sap_manager.ini"; }
+
+static wstring defaultPath(int i) {
+    switch (i) {
+        case 0: case 1: case 2: return SAP770;
+        case 3: return SLC;
+        case 4: return CRYPTO;
+        case 5: return SAP760 + L"\\#\\set_xml_path.reg";
+        default: return g_exeDir + REG_MAIN;
+    }
+}
+
+static void readPathsFromUi() {
+    for (int i = 0; i < NCOMP; i++) {
+        HWND ed = GetDlgItem(g_hwnd, IDC_PATH0 + i);
+        wstring v = trim(getText(ed));
+        if (v.empty()) { v = defaultPath(i); SetWindowTextW(ed, v.c_str()); }
+        while (!isFileComp(i) && v.size() > 3 && v.back() == L'\\') v.pop_back();
+        g_path[i] = v;
+    }
+}
+
+static void savePathsFromUi() {
+    readPathsFromUi();
+    for (int i = 0; i < NCOMP; i++) WritePrivateProfileStringW(L"Paths", INI_KEYS[i], g_path[i].c_str(), iniFile().c_str());
+}
+
+static void loadPathsToUi() {
+    if (!exists(iniFile())) writeUtf16File(iniFile(), L"[Paths]\r\n");  // UTF-16 ini: поддерживает любые символы в путях
+    for (int i = 0; i < NCOMP; i++) {
+        wchar_t buf[2048] = {};
+        GetPrivateProfileStringW(L"Paths", INI_KEYS[i], L"", buf, 2048, iniFile().c_str());
+        wstring v = trim(buf);
+        if (v.empty()) v = defaultPath(i);
+        SetWindowTextW(GetDlgItem(g_hwnd, IDC_PATH0 + i), v.c_str());
+    }
+    savePathsFromUi();  // допишет значения по умолчанию в ini
+}
+
+static int CALLBACK browseCb(HWND h, UINT m, LPARAM, LPARAM data) {
+    if (m == BFFM_INITIALIZED && data) SendMessageW(h, BFFM_SETSELECTIONW, TRUE, data);
+    return 0;
+}
+
+// Кнопка "..." : окно "Обзор..." для папки или reg-файла
+static void browseFor(int i) {
+    HWND ed = GetDlgItem(g_hwnd, IDC_PATH0 + i);
+    wstring cur = trim(getText(ed));
+    wstring res;
+    if (isFileComp(i)) {
+        wchar_t buf[2048] = {};
+        if (cur.size() < 2000) wcscpy(buf, cur.c_str());
+        OPENFILENAMEW ofn{};
+        ofn.lStructSize = sizeof ofn;
+        ofn.hwndOwner = g_hwnd;
+        ofn.lpstrFilter = L"Файлы реестра (*.reg)\0*.reg\0Все файлы (*.*)\0*.*\0";
+        ofn.lpstrFile = buf;
+        ofn.nMaxFile = 2048;
+        ofn.lpstrTitle = L"Обзор... Выберите reg-файл";
+        ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER | OFN_HIDEREADONLY;
+        if (GetOpenFileNameW(&ofn)) res = buf;
+    } else {
+        wchar_t disp[MAX_PATH] = {};
+        BROWSEINFOW bi{};
+        bi.hwndOwner = g_hwnd;
+        bi.pszDisplayName = disp;
+        bi.lpszTitle = L"Обзор... Выберите папку с файлами установки";
+        bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE | BIF_EDITBOX;
+        bi.lpfn = browseCb;
+        bi.lParam = (LPARAM)cur.c_str();
+        PIDLIST_ABSOLUTE pidl = SHBrowseForFolderW(&bi);
+        if (pidl) {
+            wchar_t b[MAX_PATH] = {};
+            if (SHGetPathFromIDListW(pidl, b)) res = b;
+            CoTaskMemFree(pidl);
+        }
+    }
+    if (!res.empty()) {
+        SetWindowTextW(ed, res.c_str());
+        savePathsFromUi();
+    }
+}
+
 static void startTask(Task t) {
     if (g_busy) return;
     wstring pc = trim(getText(GetDlgItem(g_hwnd, IDC_PC)));
@@ -811,17 +957,22 @@ static void startTask(Task t) {
         if (clean != pc) out(L"[ВНИМАНИЕ] Из имени удалены лишние символы: \"" + pc + L"\" -> \"" + clean + L"\"");
         pc = clean;
     }
-    if (pc.empty()) {
-        MessageBoxW(g_hwnd, L"Введите имя компьютера.", L"SAP Manager", MB_OK | MB_ICONWARNING);
-        SetFocus(GetDlgItem(g_hwnd, IDC_PC));
-        return;
-    }
-    if (g_pse.empty() && !findPse()) {
+    bool local = pc.empty();
+    if (!local && g_pse.empty() && !findPse()) {
         MessageBoxW(g_hwnd, L"pse.exe не найден. Положите его рядом с программой или в PATH.", L"SAP Manager", MB_OK | MB_ICONERROR);
         return;
     }
     disconnectPc();
-    g_pc = pc;
+    g_local = local;
+    if (local) {
+        wchar_t nm[MAX_COMPUTERNAME_LENGTH + 1] = {};
+        DWORD sz = MAX_COMPUTERNAME_LENGTH + 1;
+        if (!GetComputerNameW(nm, &sz)) nm[0] = 0;
+        g_pc = nm;
+    } else {
+        g_pc = pc;
+    }
+    savePathsFromUi();
     g_user = trim(getText(GetDlgItem(g_hwnd, IDC_USER)));
     g_pass = getText(GetDlgItem(g_hwnd, IDC_PASS));
     g_regUser = trim(getText(GetDlgItem(g_hwnd, IDC_REGUSER)));
@@ -858,23 +1009,25 @@ static void createControls() {
     mk(L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL, 240, 42, 150, 24, IDC_REGUSER, WS_EX_CLIENTEDGE);
     mk(L"BUTTON", L"Процесс на ПК от указанной учётки (иначе SYSTEM)", WS_TABSTOP | BS_AUTOCHECKBOX, 400, 44, 355, 20, IDC_RUNAS);
 
-    mk(L"BUTTON", L"Компоненты установки", BS_GROUPBOX, 10, 76, 745, 118, -1);
+    mk(L"BUTTON", L"Компоненты установки и пути к файлам установки (хранятся в sap_manager.ini)", BS_GROUPBOX, 10, 76, 745, 214, -1);
     for (int i = 0; i < NCOMP; i++) {
-        int col = i < 4 ? 0 : 1;
-        int row = i < 4 ? i : i - 4;
-        HWND c = mk(L"BUTTON", COMP_NAMES[i], WS_TABSTOP | BS_AUTOCHECKBOX, col ? 390 : 25, 96 + row * 22, col ? 355 : 350, 20, IDC_CHK0 + i);
+        int y = 98 + i * 26;
+        HWND c = mk(L"BUTTON", COMP_NAMES[i], WS_TABSTOP | BS_AUTOCHECKBOX, 25, y, 290, 20, IDC_CHK0 + i);
         Button_SetCheck(c, BST_CHECKED);
+        mk(L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL, 320, y - 2, 390, 24, IDC_PATH0 + i, WS_EX_CLIENTEDGE);
+        mk(L"BUTTON", L"...", WS_TABSTOP | BS_PUSHBUTTON, 715, y - 2, 30, 24, IDC_BROWSE0 + i);
     }
 
-    mk(L"BUTTON", L"Установить выбранное", WS_TABSTOP | BS_DEFPUSHBUTTON, 10, 202, 170, 30, IDC_BTN_INSTALL);
-    mk(L"BUTTON", L"Удалить SAP", WS_TABSTOP | BS_PUSHBUTTON, 190, 202, 110, 30, IDC_BTN_UNINSTALL);
-    mk(L"BUTTON", L"Crypto: проверить", WS_TABSTOP | BS_PUSHBUTTON, 310, 202, 150, 30, IDC_BTN_CRYPTO);
-    mk(L"BUTTON", L"Reg пользователю", WS_TABSTOP | BS_PUSHBUTTON, 470, 202, 150, 30, IDC_BTN_REG);
-    mk(L"BUTTON", L"Статус", WS_TABSTOP | BS_PUSHBUTTON, 630, 202, 125, 30, IDC_BTN_STATUS);
+    mk(L"BUTTON", L"Установить выбранное", WS_TABSTOP | BS_DEFPUSHBUTTON, 10, 300, 170, 30, IDC_BTN_INSTALL);
+    mk(L"BUTTON", L"Удалить SAP", WS_TABSTOP | BS_PUSHBUTTON, 190, 300, 110, 30, IDC_BTN_UNINSTALL);
+    mk(L"BUTTON", L"Crypto: проверить", WS_TABSTOP | BS_PUSHBUTTON, 310, 300, 150, 30, IDC_BTN_CRYPTO);
+    mk(L"BUTTON", L"Reg пользователю", WS_TABSTOP | BS_PUSHBUTTON, 470, 300, 150, 30, IDC_BTN_REG);
+    mk(L"BUTTON", L"Статус", WS_TABSTOP | BS_PUSHBUTTON, 630, 300, 125, 30, IDC_BTN_STATUS);
 
     g_hLog = mk(L"EDIT", L"", WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | ES_AUTOHSCROLL,
-                10, 242, 745, 300, IDC_LOG, WS_EX_CLIENTEDGE);
+                10, 340, 745, 300, IDC_LOG, WS_EX_CLIENTEDGE);
     SendMessageW(g_hLog, EM_SETLIMITTEXT, 0x7FFFFFF, 0);
+    SendMessageW(GetDlgItem(g_hwnd, IDC_PC), EM_SETCUEBANNER, TRUE, (LPARAM)L"пусто = этот компьютер");
 
     NONCLIENTMETRICSW ncm{};
     ncm.cbSize = sizeof ncm;
@@ -891,19 +1044,20 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         case WM_CREATE:
             g_hwnd = h;
             createControls();
+            loadPathsToUi();
             if (findPse()) out(L"pse.exe: " + g_pse);
             else out(L"[ВНИМАНИЕ] pse.exe не найден (положите рядом с программой или в PATH).");
-            out(L"Введите имя компьютера и нажмите \"Статус\" или выберите действие.\n");
+            out(L"Введите имя компьютера (пусто = этот компьютер) и нажмите \"Статус\" или выберите действие.\n");
             return 0;
         case WM_SIZE: {
             int cw = LOWORD(l), ch = HIWORD(l);
-            if (g_hLog) MoveWindow(g_hLog, 10, 242, cw - 20 > 100 ? cw - 20 : 100, ch - 252 > 60 ? ch - 252 : 60, TRUE);
+            if (g_hLog) MoveWindow(g_hLog, 10, 340, cw - 20 > 100 ? cw - 20 : 100, ch - 350 > 60 ? ch - 350 : 60, TRUE);
             return 0;
         }
         case WM_GETMINMAXINFO: {
             MINMAXINFO* mi = (MINMAXINFO*)l;
             mi->ptMinTrackSize.x = 800;
-            mi->ptMinTrackSize.y = 480;
+            mi->ptMinTrackSize.y = 560;
             return 0;
         }
         case WM_COMMAND:
@@ -913,6 +1067,10 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 case IDC_BTN_CRYPTO: startTask(T_CRYPTO); break;
                 case IDC_BTN_REG: startTask(T_REG); break;
                 case IDC_BTN_STATUS: startTask(T_STATUS); break;
+                default: {
+                    int id = LOWORD(w);
+                    if (id >= IDC_BROWSE0 && id < IDC_BROWSE0 + NCOMP && !g_busy) browseFor(id - IDC_BROWSE0);
+                }
             }
             return 0;
         case WM_APP_LOG: {
@@ -929,6 +1087,7 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             if (g_busy && MessageBoxW(h, L"Операция ещё выполняется. Закрыть программу?", L"SAP Manager",
                                       MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES)
                 return 0;
+            savePathsFromUi();
             DestroyWindow(h);
             return 0;
         case WM_DESTROY:
@@ -940,6 +1099,7 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 }
 
 int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR, int show) {
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
     INITCOMMONCONTROLSEX ic{sizeof ic, ICC_STANDARD_CLASSES};
@@ -960,7 +1120,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR, int show) {
     wc.lpszClassName = L"SapManagerWnd";
     RegisterClassExW(&wc);
 
-    RECT r = {0, 0, 765, 580};
+    RECT r = {0, 0, 765, 660};
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
     HWND hw = CreateWindowExW(0, wc.lpszClassName, L"SAP Manager — установка SAP GUI + Crypto (pse -r ps_sap)",
                               WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top,
@@ -976,5 +1136,6 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR, int show) {
             DispatchMessageW(&msg);
         }
     }
+    CoUninitialize();
     return (int)msg.wParam;
 }
